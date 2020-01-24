@@ -95,6 +95,8 @@ adata.obs.loc[adata.obs.lineage.isin(reslin)==True,'recalled_lin'] = 'res_lin'
 adata.obs.loc[adata.obs.lineage.isin(reslin)==False,'recalled_lin'] = 'na'
 adata.obs.loc[adata.obs.lineage.isin(senslin)==True,'recalled_lin'] = 'sens_lin'
 
+
+
 print(adata.obs['recalled_lin'])
 #%% Add a column to rename the samples by time point
 samps= adata.obs['sample'].unique()
@@ -174,6 +176,8 @@ nsr= len(dfsr)
 
 y= pd.factorize(dfsr['classLabel'])[0] 
 nres = sum(y)
+
+yisoS = pd.factorize(dfsr['recalled_lin'])[0]
 
 mu_sr = sum(y)/len(y)
 print(mu_sr)
@@ -271,18 +275,27 @@ plt.ylabel('CDF of variance in each PC')
 PCs_sr=pca.transform(Xsr)
 PCsrdf = pd.DataFrame(PCs_sr)
 PCsrdf['classlabel'] = y
+PCsrdf['recalled_lin'] = yisoS
 PCsrdf.reset_index(drop=True, inplace=True)
 PCsrdfs = PCsrdf[PCsrdf['classlabel']==0]
 PCsrdfr = PCsrdf[PCsrdf['classlabel']==1]
+PCsrdfisoS=PCsrdf[PCsrdf['recalled_lin']==1]
+PCsrdfisoR=PCsrdf[PCsrdf['recalled_lin']==2]
 xsrs= np.asarray(PCsrdfs[0])
 ysrs=np.asarray(PCsrdfs[1])
 xsrr= np.asarray(PCsrdfr[0])
 ysrr=np.asarray(PCsrdfr[1])
+xisoS=np.asarray(PCsrdfisoS[0]) 
+yisoSs=np.asarray(PCsrdfisoS[1])
+xisoR=np.asarray(PCsrdfisoR[0])
+yisoR=np.asarray(PCsrdfisoR[1])
 
 fig = plt.figure(figsize=(10,10))
 
 srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1, label = 't=0 wks labeled sensitive')
 srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1, label = 't=0 wks labeled resistant')
+srisos = plt.scatter(xisoS, yisoSs, c = 'b', marker = 'o', alpha = 1, label = 'isolated S')
+srisoR = plt.scatter(xisoR, yisoR, c = 'm', marker = 'o', alpha=1, label = 'isolated R')
 
 plt.xlabel('PC1')
 plt.ylabel('PC2')
@@ -364,7 +377,12 @@ filename = "SRlabeled_pre.csv"
 #%% Also plot the principal components for each time point 
 Xpre = adata_pre.raw.X
 PCspre=pca.transform(Xpre)
+
+
+
+
 # Pre-treatment
+
 PCpredf = pd.DataFrame(PCspre)
 PCpredf.reset_index(drop=True, inplace=True)
 ypre.reset_index(drop=True, inplace=True)
@@ -382,13 +400,18 @@ yprer=np.asarray(PCpredfr[1])
 
 fig = plt.figure(figsize=(10,10))
 
-srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1, label = 't=0 hr labeled sensitive')
-srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1, label = 't=0 hr labeled resistant')
+srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1) # label = 't=0 hr labeled sensitive')
+srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1)# label = 't=0 hr labeled resistant')
+
 #pre_cells = plt.scatter(xp, yp, c='b', marker='o', alpha = 0.2, label = 't=0 hr remaining')
-pres = plt.scatter(xpres, ypres, c='olivedrab', marker='+', alpha = 0.5, label = 't=0 hr est sensitive')
-prer = plt.scatter(xprer, yprer, c='pink', marker='+', alpha = 0.5, label = 't=0 hr est resistant')
+pres = plt.scatter(xpres, ypres, c='olivedrab', marker='+', alpha = 0.5) #label = 't=0 hr est sensitive')
+prer = plt.scatter(xprer, yprer, c='pink', marker='+', alpha = 0.5)# label = 't=0 hr est resistant')
+srisos = plt.scatter(xisoS, yisoSs, c = 'lime', marker = 'o', alpha = 1)# label = 'isolated S')
+srisoR = plt.scatter(xisoR, yisoR, c = 'magenta', marker = 'o', alpha=1)# label = 'isolated R')
 plt.xlabel('PC1')
 plt.ylabel('PC2')
+
+plt.ylim(-18, 28)
 
 plt.legend(loc=1, prop={'size': 15})
 
@@ -407,6 +430,7 @@ phirpost1 = (sum(ypost1))/npost1
 print(phirpost1)
 phispost1 = 1-phirpost1
 print(phispost1)
+
 
 #%% Also plot the principal components for each time point 
 Xpost1 = adata_post1.raw.X
