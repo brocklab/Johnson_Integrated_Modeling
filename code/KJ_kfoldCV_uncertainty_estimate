@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jul  2 10:49:00 2019
+
+@author: kj22643
+"""
+
+%reset
+
+import numpy as np
+import pandas as pd
+import os
+import scanpy as sc
+import seaborn as sns
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.pyplot import plot, show, draw, figure, cm
+import matplotlib as plt
+import random
+from collections import OrderedDict
+import copy
+import matplotlib.pyplot as plt
+from pandas import DataFrame, Series
+import plotnine as gg
+import scipy as sp
+import scipy.stats as stats
+import sklearn as sk
+import sklearn.model_selection as model_selection
+from sklearn.model_selection import ShuffleSplit
+from sklearn.model_selection import StratifiedKFold
+import sklearn.feature_selection as feature_selection
+import sklearn.linear_model as linear_model
+import sklearn.pipeline as pipeline
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn import svm
+from sklearn import metrics
+from sklearn.metrics import roc_curve, auc
+os.chdir('/Users/kj22643/Documents/Documents/231_Classifier_Project/code')
+from func_file import find_mean_AUC
+from func_file import find_mean_AUC_SVM
+
+
+
+path = '/Users/kj22643/Documents/Documents/231_Classifier_Project/data'
+#path = '/stor/scratch/Brock/231_10X_data/'
+os.chdir(path)
+sc.settings.figdir = 'KJ_plots'
+sc.set_figure_params(dpi_save=300)
+sc.settings.verbosity = 3
+adata = sc.read('daylin_anndata.h5ad')
+adata.obs.head()
+# current samples:
+#BgL1K
+#30hr
+#Rel-1
+#Rel-2
+# We will change these to time points
+#%% Assign survivor category in adata.obs
+longTreatLins = adata.obs.loc[(adata.obs['sample'].isin(['Rel-1','Rel-2']))&(adata.obs.lineage!='nan'),'lineage'].unique().tolist()
+
+adata.obs.loc[adata.obs.lineage.isin(longTreatLins)==False,'survivor'] = 'sens'
+adata.obs.loc[adata.obs.lineage.isin(longTreatLins)==True,'survivor'] = 'res'
+samps= adata.obs['sample'].unique()
+timepoint = np.array(['t=0hr', 't=30hr', 't=1344hr'])
+adata.obs.loc[adata.obs['sample']==samps[0], 'timepoint']='t=0hr'
+adata.obs.loc[adata.obs['sample']==samps[1], 'timepoint']='t=30hr'
+adata.obs.loc[adata.obs['sample']==samps[2], 'timepoint']='t=1344hr'
+adata.obs.loc[adata.obs['sample']==samps[3], 'timepoint']='t=1344hr'
+
+#%% Separately make dataframes for the pre-treatment, intermediate, and post treatment samples
+# t=0 hr (pre-treatment), 3182 pre treatment cells
+# We want to keep the info about the lineage so we can potentially
+# use it to make evenly divided testing and training data sets
+adata_pre = adata[adata.obs['timepoint']=='t=0hr', :]
+dfpre = pd.concat([adata_pre.obs['survivor'], adata_pre.obs['lineage'],
+               pd.DataFrame(adata_pre.raw.X,index=adata_pre.obs.index,
+                            columns=adata_pre.var_names),],axis=1) 
+# t = 30 hr (intermediate timepoint) 5169 int treatment cells
+adata_int = adata[adata.obs['timepoint']=='t=30hr', :]
+dfint = pd.concat([adata_int.obs['lineage'],
+                   pd.DataFrame(adata_int.raw.X, index=adata_int.obs.index, 
+                                columns = adata_int.var_names),], axis=1)
+# t=1344 hr (~roughly 8 weeks), 10332 post treatment cells
+adata_post = adata[adata.obs['timepoint']=='t=1344hr', :]
+dfpost = pd.concat([adata_post.obs['lineage'],
+                    pd.DataFrame(adata_post.raw.X, index=adata_post.obs.index, 
+                                 columns = adata_post.var_names),],axis =1)
+
+
+
+#%% Use sklearn to do principle component analysis on the  entire pre-treatment sample
+#X = dfpre.loc[:, dfpre.columns !='survivor', dfpre.columns !='lineage']
+X = dfpre.drop(columns= ['survivor', 'lineage'])
+y= pd.factorize(dfpre['survivor'])[0] 
+phi0 = sum(y)/len(y)
+#%%
+# Start by writing the pseudo-code to generate 
+
+# Step 1: Generate B bootstrap samples of size n with simple random sampling.
+B=100 # The number of bootstrap data sets
+ncells = len(y)
+bootstrap_dict = {'Xbs':{}, 'ybs':{}, 'bs_indices':{}, 'mvec':{}, 'theta':{},}
+Xbs = {}
+ybs = {}
+bs_indices = {}
+mvec = {}
+theta = {}
+for i in range(B):
+    # draw randomly from the indices 1:ncells to generate a boostrap sample from X and save it in a dictionary
+    bs_indices= np.random.randint(ncells,size = ncells)
+
+    # add these indices to the dictionary
+    # make the m vector, which counts the number of 0s through ns observed in bs_indices
+    #and add this to the dictionary
+    mvec[i] = np.zeros((ncells,1)) # placeholder, this will be filled with the number of observations at each index in the BS sample
+    
+    # make the bootstrapped data set using the bootstrapindices
+    Xbs[i] = X.iloc[bs_indices, :]
+    ybs[i] =y.iloc[bs_indices,:]
+    
+# Put all of the bootstrap samples into a dictionary that contains the B bootstrapped data sets
+bootstrap_dict['Xbs'] = Xbs
+bootstrap_dict['ybs']= ybs
+bootstrap_dict['bs_indices'] = bs_indices
+bootstrap_dict['mvec'] = mvec
+
+# Within each bootstrap data set, need to perform LOOCV on each index, and keep track of the number of correctly predicted samples
+for i in range(B):
+    ct_corr = 0
+    # declare the X for the bootstrap sample
+    Xbs = bootstrap_dict['Xbs'][i]
+    ybs = bootstrap_dict['ybs'][i]
+    for j in range(ncells):
+        # perform LOOCV on data set that excludes the jth index
+        # need to remove all of the indices that contain 0, 1, 2.... n from training set
+        train_ind = bs_indices[i]!=j
+        Xtrain = Xbs.iloc[train_ind,:]
+        ytrain = ybs.iloc[train_ind,:]
+
+
+
+
+
+
+
+

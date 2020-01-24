@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue May 28 14:51:10 2019
+
+@author: kj22643
+"""
+%reset
+
+import numpy as np
+import pandas as pd
+import os
+import scanpy as sc
+import seaborn as sns
+from plotnine import *
+path = '/Users/kj22643/Documents/Documents/231_Classifier_Project/data'
+#path = '/stor/scratch/Brock/231_10X_data/'
+os.chdir(path)
+sc.settings.figdir = 'KJ_plots'
+sc.set_figure_params(dpi_save=300)
+sc.settings.verbosity = 3
+# Try loading in Eric's data frame to see if we can start to perform some 
+# matrix operations on the gene expression data set.
+
+#%%
+adataEB = sc.read('231_all_samples_post-leiden-clustering.h5ad')
+
+survlins = adataEB.obs.loc[(adataEB.obs['sample'].isin(['107Aziz','113Aziz']))&(adataEB.obs.lineage!='nan'),'lineage'].unique().tolist()
+adataEB.obs.loc[adataEB.obs.lineage.isin(survlins)==False,'survivor'] = 'sens'
+adataEB.obs.loc[adataEB.obs.lineage.isin(survlins)==True,'survivor'] = 'res'
+
+print(adataEB.obs['survivor'])
+#%% Look at what the smaples are called to see what the pre-treatment sample is called
+print(adataEB.obs)
+
+#%% Take only the TP0 anndata object
+# made up 3182 cells (rows) with 
+adata_subset = adataEB[adataEB.obs['sample']=='Doxneg', :]
+#%% View the subset
+# 3182 cells with 22191 genes 
+print(adata_subset)
+#%% View just the survivor info
+print(adata_subset.obs['survivor'])
+# this
+
+#%% Make a data frame with the raw gene expression matrix 
+# each column is a gene, each row is a cell
+
+
+df = pd.concat([adata_subset.obs['survivor'], pd.DataFrame(adata_subset.raw.X,index=adata_subset.obs.index,
+                            columns=adata_subset.var_names),],axis=1) 
+#%%
+print(df) # 22192 columns corresponding to 22191 genes
+#%%
+labelsdf = df['survivor']
+print(labelsdf)
+#%%
+genematdf = df.loc[:, df.columns != 'survivor']
+print(genematdf)
+#%%
