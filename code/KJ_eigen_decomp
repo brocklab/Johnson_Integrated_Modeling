@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed May 29 12:29:10 2019
+
+@author: kj22643
+"""
+
+%resety
+
+import numpy as np
+import pandas as pd
+import os
+import scanpy as sc
+import seaborn as sns
+from plotnine import *
+path = '/Users/kj22643/Documents/Documents/231_Classifier_Project/data'
+#path = '/stor/scratch/Brock/231_10X_data/'
+os.chdir(path)
+sc.settings.figdir = 'KJ_plots'
+sc.set_figure_params(dpi_save=300)
+sc.settings.verbosity = 3
+#%% Load in pre and post data
+adata_pre = sc.read('KJ_adatapre.h5ad')
+adata_post = sc.read('KJ_adatapost.h5ad')
+dfpre = pd.concat([adata_pre.obs['survivor'], adata_pre.obs['sample'],pd.DataFrame(adata_pre.raw.X,index=adata_pre.obs.index,
+                            columns=adata_pre.var_names),],axis=1) 
+dfpost= pd.concat([adata_post.obs['sample'],pd.DataFrame(adata_post.raw.X,index=adata_post.obs.index,
+                            columns=adata_post.var_names),],axis=1) 
+#%% Try making a UMAP of the first sample only
+
+sc.pl.umap(adata_pre,color=['survivor'],wspace=0.3,
+           save='pre_treat_res_sens.png')
+
+sc.pl.umap(adata_post,color=['sample'],wspace=0.3,
+           save='post_treat_umap.png')
+#%%
+print(dfpre) # 22192 columns corresponding to 22191 genes
+#%% Make series that label the pre-treatment cells as res/sens and label the 
+# label the post treatment cells by their sample
+labelsdfpre = dfpre['survivor']
+print(labelsdfpre)
+samplabspost = dfpost['sample']
+#%% Make matrices (data frames) of just the cell-gene matrix for the pre treatment and 
+# post treatment samples
+genematpre1 = dfpre.loc[:, dfpre.columns !='survivor']
+genematpre= genematpre1.loc[:, genematpre1.columns !='sample']
+
+genematpost = dfpost.loc[:, dfpost.columns !='sample']
+print(genematpre)
+# Now genematpre and genemat post are your ncells rows x ngenes columns gene 
+# expression matrices.
+#%% Now try to emulate your matlab code... 
+# Start with just your pre-treatment time point
+# In Matlab we have an x by k where x would be all the genes and k are the indivdual 
+# cells (so each column is a cell and each row is a gene)
+
+# let's see if we can make that in python and call it Adf
+ncells = genematpre.shape[0] # this gets the number of rows in the df (number of cells)
+ntrain = round(ncells/10)  # start by setting the number of training cells to 1/10th 
+#%%
+AdfT= genematpre
+Adf = AdfT.T
+print(Adf)
+#%%
+AtrT= AdfT.iloc[0:ntrain]
+Atr = AtrT.T
+print(Atr)
+# now we have each cell as a column and each row as a gene.
+#%% Next, we want to find the mean vector and the eigenvectors for a small subset of the data
+m = Atr.mean(axis =1)
+print(m)
+# make your small covariance matrix
+X = Atr.sub(m, axis=0)
+print(X)
+Xmat= X.as_matrix()
+XmatT = Xmat.T
+print(XmatT)
+# since we have less cells (3182) than genes (22191) it makes sense to find A'*A 
+# which is the (ncells x ngenes * ngenes x ncells = ncells x ncells square small covariance matrix)
+smallcov = np.matmul(XmatT,Xmat) # Now you have your ntrain x ntrain small covariance matrix
+
+#%%Find the eigenvectors of the small covariance matrix
+# in MATLAB:
+# [Vsmall,D] =eig(smallcov)
+# lamdas = diag(D)
+# [orderedvals, ind] = sort(lambdas, 'descend');
+# Vnew = Vsmall(:,ind);
+#Vbig = A0*Vnew;
+# Want to normalize each eigenvector
+#k = length(lambdas);
+#for j = 1:k
+    ## find the 2-norm of each column
+    #norms(j) = norm(Vbig(:,j));
+    
+    #V(:,j) = Vbig(:,j)./norms(j);
+#end
+from numpy import linalg as LA
+lambdas, Vsmall= LA.eig(smallcov)
+# returns the eigenvalues (lambdas) and eigenvectors that are normalized (Euclidean norms are 1)
+print(lambdas)
+ind_arr = np.argsort(lambdas)
+ind= ind_arr[1]
+print(ind_arr)
+#%% Reorder your lambdas and eigenvectors (Vsmall)
+Vnew = Vsmall[ind_arr]
+#%% Now apply to the big system
+# Since XX'x=mux
+# Let x = Xv
+# XX'Xv = mu Xv
+# XX' = big cov matrix
+# X'X = small cov matrix
+
+# These are the eigenvectors of the big covariance matrix 
+Vbig = np.matmul(X, Vnew)
+#%% Now that you have your ngenes x ntraining cells matrix of eigenvectors, make sure the 
+# big covariance matrix is normalized
+norms = LA.norm(Vbig, axis = 0)
+Vnorm = Vbig/norms
+testnorms = LA.norm(Vnorm, axis = 0)
+#%% Now you have the Eigenspace, defined by Vnorm, which contains normalized eigenvectors of
+# the length of the number of genes, in order of importance
