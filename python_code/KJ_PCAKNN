@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jul 23 11:04:16 2020
+
+@author: kj22643
+"""
+
+# The goal of this script is to run the classificaiton problem and generate 
+# outputs for the PCA + KNN classifier of the cells. All these outputs will be 
+# put into the supplement only. 
+
+%reset
+
+import numpy as np
+import pandas as pd
+import os
+import scanpy as sc
+import seaborn as sns
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.pyplot import plot, show, draw, figure, cm
+import matplotlib as plt
+import random
+from collections import OrderedDict
+import copy
+import math
+import matplotlib.pyplot as plt
+from pandas import DataFrame, Series
+import plotnine as gg
+import scipy as sp
+import scipy.stats as stats
+import sklearn as sk
+import sklearn.model_selection as model_selection
+from sklearn.model_selection import ShuffleSplit
+from sklearn.model_selection import StratifiedKFold
+import sklearn.feature_selection as feature_selection
+import sklearn.linear_model as linear_model
+import sklearn.pipeline as pipeline
+import csv
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.cluster import KMeans
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn import svm
+from sklearn.svm import LinearSVC      
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn import metrics
+from sklearn.metrics import roc_curve, auc
+os.chdir('/Users/kj22643/Documents/Documents/231_Classifier_Project/code')
+from func_file import find_mean_AUC
+from func_file import find_mean_AUC_SVM
+
+
+# Set path to the folder containing the scRNAseq data
+path = '/Users/kj22643/Documents/Documents/231_Classifier_Project/data'
+#path = '/stor/scratch/Brock/231_10X_data/'
+os.chdir(path)
+sc.settings.figdir = 'KJ_plots'
+sc.set_figure_params(dpi_save=300)
+sc.settings.verbosity = 3
+#%% Load in pre and post treatment 231 data
+adata = sc.read('post-cell-cycle-regress.h5ad')
+adata.obs.head()
+uniquelins = adata.obs['lineage'].unique()
+nunique = len(uniquelins)
+
+#Identify lineages that have been recalled from the pre-treatment sample
+# Make a column labeled recalled lin that can be use to identify the specific lineages of interest
+
+# These correspond to AA161 and AA170
+# AA170 is the highly proliferative lineage that ultimately decreases in lineage abundance
+# AA161 is a lowly abundant in the pre-treatment but is one of the ones that comes
+# to  be highly abundance in both post treatment samples
+
+reslin = ['GTACATTTTCATACCTCTCG']
+senslin = ['GTGTGTTGTTTTTGTACGGC']
+
+
+adata.obs.loc[adata.obs.lineage.isin(reslin)==True,'recalled_lin'] = 'res_lin'
+adata.obs.loc[adata.obs.lineage.isin(reslin)==False,'recalled_lin'] = 'na'
+adata.obs.loc[adata.obs.lineage.isin(senslin)==True,'recalled_lin'] = 'sens_lin'
+
+# Name samples by their time point 
+samps= adata.obs['sample'].unique()
+
+timepoint = np.array(['t=0 wks', 't=7 wks', 't=10 wks'])
+
+adata.obs.loc[adata.obs['sample']==samps[0], 'timepoint']='t=0 wks'
+adata.obs.loc[adata.obs['sample']==samps[1], 'timepoint']='t=7 wks'
+adata.obs.loc[adata.obs['sample']==samps[2], 'timepoint']='t=10 wks'
+
+
+TP = np.array(['pre', 'post'])
+
+adata.obs.loc[adata.obs['sample']==samps[0], 'TP']='pre'
+adata.obs.loc[adata.obs['sample']==samps[1], 'TP']='post'
+adata.obs.loc[adata.obs['sample']==samps[2], 'TP']='post'
+
+# Plot all data in a umap colored by timepoint, show qhwew the resistant and
+# sensitive lineages are within this
+  
+sc.pl.umap(adata,color='timepoint',palette=['#f79d02', '#d604f7', '#00c6c6'])
+sc.pl.umap(adata,color='recalled_lin',palette=['gray','#c91212','#2c9e2f'])
+    
+#%% Calculate the pre and post treatment lineage abundances
+# lineage counts = the number of cells in a lineage
+# lineage abundance = the proportion of a population the cells in that lineage
+# take up at a specific time point.
+# Calculate the magnitude of change in lineage abundance
+# change_i = abund_post_i - abund_pre_i
+
+
+lincountspre= adata.obs.loc[adata.obs.TP=='pre','lineage'].value_counts()
+lincountspost= adata.obs.loc[adata.obs.TP=='post','lineage'].value_counts()
+
+npre = sum(lincountspre)
+npost=sum (lincountspost)
+linabundpre = lincountspre/npre
+linabundpost = lincountspost/npost
+# Put into a dictionary to compare the lineage abundances at each time point
+dpost = linabundpost.to_dict()
+dpre = linabundpre.to_dict()
+# dchange = the change in lineage abundance from pre to post of an individual lineage
+# key = lineage, val = change in lineage abundance
+dchange = {key: dpost[key] - dpre.get(key, 0) for key in dpost.keys()}
+# save this dictionary into the anndata object
+adata.uns['linabundchange'] = dchange
+linabundchange = adata.uns['linabundchange']
+# output these lists of lineage abundances to csv files
+a_file = open("linabundchange.csv", "w")
+writer = csv.writer(a_file)
+for key, value in linabundchange.items():
+    writer.writerow([key, value])
+    
+a_file.close()
+linabundpre.to_csv("linabundpre.csv")
+filename = "linabundpre.csv"
+linabundpost.to_csv("linabundpost.csv")
+filename = "linabundpost.csv"
+#%%Map the lineages in dchange to the cells in the anndata object
+# each cell now is labeled by the amount its lineage changes post treatment
+adata.obs['linabundchange']= adata.obs['lineage'].map(dchange)
+# Set the threshold for calling cells sensitive or resistant, pulling from only
+# the lineages with greatest increase (R) or decrease (S) in abundance 
+S_threshold = 0.05
+R_threshold = 0
+# Plot the change in lineage abundance distribution                                       
+plt.figure()
+plt.hist(adata.obs.loc[adata.obs.timepoint == 't=0 wks','linabundchange'], bins = 100)
+plt.plot([R_threshold,R_threshold], [0,900], c='r', alpha = 1, label = 'R')
+plt.plot([-S_threshold, -S_threshold],[0,900], c='g', alpha = 1, label = 'S')
+plt.xlabel(' Change in lineage abundance')
+plt.ylabel('Number of cells in the lineage')
+plt.title('Lineage Abundance Distribution')
+plt.legend(loc=1, prop={'size': 15})     
+plt.ylim(0, 900)
+plt.xlim(-0.5, 0.5)
+plt.grid(b=None)
+                                    
+
+#%% Make the sensitive and resistant labels within your anndata object
+
+classLabel = np.array(['res', 'sens', 'unknown', 'res_est', 'sens_est'])
+adata.obs.loc[adata.obs.timepoint=='t=0 wks','classLabel'] = 'unknown'
+adata.obs.loc[adata.obs.timepoint=='t=7 wks','classLabel'] = 'unknown'
+adata.obs.loc[adata.obs.timepoint=='t=10 wks','classLabel'] = 'unknown'
+adata.obs.loc[(adata.obs.linabundchange>R_threshold)&(adata.obs.timepoint=='t=0 wks'), 'classLabel'] = 'res'
+adata.obs.loc[(adata.obs.linabundchange<-S_threshold)&(adata.obs.timepoint=='t=0 wks'), 'classLabel'] = 'sens'
+adata.obs.loc[adata.obs.lineage=='nan', 'classLabel'] = 'unknown'
+#adata.obs.loc[(adata.obs.linpropchange<-0.5)&(adata.obs.timepoint=='t=0hr'), 'classLabel'] = 'sens'
+
+# plot the labeled cells alongside unknown cells and alone on same axes.
+sc.pl.umap(adata,color='classLabel', palette = ['red', 'green', 'gray'])
+sc.pl.umap(adata,color='classLabel', palette = ['red', 'green', 'white'])
+
+
+#%% Now we want to take out only the data that is labeled as res and sens 
+# and test the classifier on the labeled dataset
+adata_sr= adata[(adata.obs['classLabel']=='res')|(adata.obs['classLabel']=='sens'), :]
+dfsr= pd.concat([adata_sr.obs['lineage'],adata_sr.obs['classLabel'],
+               pd.DataFrame(adata_sr.raw.X,index=adata_sr.obs.index,
+                            columns=adata_sr.var_names),], axis=1) 
+# plot only the labeled cells
+sc.pl.umap(adata_sr,color='classLabel',palette=['red', 'green']) 
+
+nsr= len(dfsr)
+y= pd.factorize(dfsr['classLabel'])[0] 
+nres = sum(y)
+mu_sr = sum(y)/len(y) # shows how we have unbalanced class sizes
+print(mu_sr)
+# Xsr is your cell gene matrix, y is your class labels
+Xsr = dfsr.drop(columns= [ 'classLabel', 'lineage'])
+# %%Assign the parameters for PCA+KNN and Linear SVM and fit the models
+# PCA hyperparameters optimized in KJ_find_hyperparameters.py 
+
+# SET UP PCA
+n_neighbors = 73
+n_components = 500
+
+knn = KNeighborsClassifier(n_neighbors=n_neighbors)
+
+pca=PCA(copy=True, iterated_power='auto', n_components=n_components, random_state=0,
+            svd_solver='auto', tol=0.0, whiten=False)
+# FIT PCA
+pca.fit(Xsr, y)
+knn.fit(pca.transform(Xsr), y)
+# the components is a n_components x n-total genes matrix that gives the weight of 
+# each gene that goes into making the principal component.
+components = pca.components_
+compdf = pd.DataFrame(components, columns = adata_sr.var_names)
+adata.uns['components'] = compdf
+# We cann use the compdf to make the arrow plot of the gene weights in PC space 
+V = pca.fit_transform(Xsr) 
+PCsr = pca.transform(Xsr)
+var_in_PCs= pca.explained_variance_ratio_
+cdf_varPCs = var_in_PCs.cumsum()
+
+# Plot the variance explained in each PC
+
+plt.figure()
+plt.plot(np.linspace(1,50, num=50), 100*cdf_varPCs[0:50] )
+plt.xlabel('Pricipal Component')
+plt.ylabel('Cumulative % of Variance Explained')
+plt.title('CDF of Variance in top 50 PCs')
+plt.xlim([1, 50])     
+plt.grid(b=None)
+
+plt.figure()
+plt.plot(np.linspace(1,len(cdf_varPCs), num=len(cdf_varPCs)), 100*cdf_varPCs )
+plt.xlabel('Pricipal Component')
+plt.ylabel('Cumulative % of Variance Explained')
+plt.title('CDF of Variance in all PCs')
+plt.xlim([1, len(cdf_varPCs)])     
+plt.grid(b=None)
+
+plt.figure()
+plt.plot(np.linspace(1,50, num=50), 100*var_in_PCs[0:50], color= 'green' )
+plt.xlabel('Pricipal Component')
+plt.ylabel('% of Variance Explained in each PC')
+plt.title('Variance in top 50 PCs')
+plt.xlim([1, 50])     
+plt.grid(b=None)
+#%% Components of PC1 and PC2 
+PC1 = compdf.iloc[0,:]
+PC2 = compdf.iloc[1,:]
+
+topgenesPC1=PC1.iloc[(-np.abs(PC1.values)).argsort()]
+topgenesPC2=PC2.iloc[(-np.abs(PC2.values)).argsort()]
+
+# Pull out a few to plot
+sc.pl.umap(adata_sr,color=['UBE2S'])
+sc.pl.umap(adata_sr,color=['NEAT1'])
+sc.pl.umap(adata_sr,color=['TOP2A'])
+sc.pl.umap(adata_sr, color = ['IL1RAPL1'])
+sc.pl.umap(adata_sr,color = ['IL18'])
+
+sc.pl.umap(adata,color=['UBE2S'])
+sc.pl.umap(adata,color=['NEAT1'])
+sc.pl.umap(adata,color=['TOP2A'])
+sc.pl.umap(adata, color = ['IL1RAPL1'])
+sc.pl.umap(adata,color = ['IL18'])
+#%% Visualize the labeled cells in PC space 
+PCs_sr=pca.transform(Xsr)
+PCsrdf = pd.DataFrame(PCs_sr)
+PCsrdf['classlabel'] = y
+PCsrdf.reset_index(drop=True, inplace=True)
+PCsrdfs = PCsrdf[PCsrdf['classlabel']==0]
+PCsrdfr = PCsrdf[PCsrdf['classlabel']==1]
+xsrs= np.asarray(PCsrdfs[0])
+ysrs=np.asarray(PCsrdfs[1])
+zsrs = np.asarray(PCsrdfs[2])
+xsrr= np.asarray(PCsrdfr[0])
+ysrr=np.asarray(PCsrdfr[1])
+zsrr = np.asarray(PCsrdfr[2])
+from mpl_toolkits.mplot3d import Axes3D
+fig = plt.figure(figsize=(10,10))
+# Run for 3D plot
+#ax = plt.axes(projection ="3d") 
+
+  
+# Creating plot 
+# Run for 3D plot
+#srs = ax.scatter3D(xsrs, ysrs, zsrs, c='g', marker='^', alpha = 1, label = 't=0 wks labeled sensitive')
+#srr = ax.scatter3D(xsrr, ysrr, zsrr, c='r', marker='^', alpha = 1, label = 't=0 wks labeled resistant')
+# for 2D plot
+srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1)
+srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1)
+# for labels plot these:
+#srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1, label = 't=0 wks labeled sensitive')
+#srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1, label = 't=0 wks labeled resistant')
+#srisos = plt.scatter(xisoS, yisoSs, c = 'b', marker = 'o', alpha = 1, label = 'isolated S')
+#srisoR = plt.scatter(xisoR, yisoR, c = 'm', marker = 'o', alpha=1, label = 'isolated R')
+
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.grid(b=None)
+plt.ylim(-18, 28)
+plt.xlim(-18, 43)
+
+#plt.legend(loc=1, prop={'size': 15})
+
+
+#%% Now project the unknown cells onto this PC space
+#Apply the pca and knn classifier to the pre, int, and post1&2 treatment samples. 
+# make a subset of your ann data
+adata_unk= adata[(adata.obs['classLabel']=='unknown'), :]
+# Make a data frame with just the raw gene-cell matrix but keep the cell identity
+Xunk = pd.DataFrame(adata_unk.raw.X,index=adata_unk.obs.index,
+                            columns=adata_unk.var_names)
+# Use knn to make a vector of predicted classes
+thres_prob = 0.2
+y_unk = knn.predict(pca.transform(Xunk))
+pre_prob= knn.predict_proba(pca.transform(Xunk))
+# Vary the threshold probability 
+thres_prob = 0.2
+B = pre_prob[:,1]>thres_prob
+y_est=B*1
+
+# RUN FOR PCA
+class_est= pd.DataFrame(y_est, index = adata_unk.obs.index)
+
+# Map the class estimate back to the anndata object
+class_est.columns=['est']
+adata.obs['class_est'] = adata.obs.index.map(class_est.est)
+sc.pl.umap(adata,color=['class_est'])
+adata.obs.loc[adata.obs.class_est==1, 'classLabel'] = 'res'
+adata.obs.loc[adata.obs.class_est==0, 'classLabel'] = 'sens'
+
+# Make a new .obs variable that divides into time point and class label
+TPclass = np.array(['t=0 wks sens', 't=0 wks res', 't=7 wks sens', 't=7 wks res', 't=10 wks sens', 't=10 wks res'])
+
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.classLabel == 'sens'), 'TPclass'] = 't=0 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.classLabel == 'res'), 'TPclass'] = 't=0 wks res'
+adata.obs.loc[(adata.obs.timepoint=='t=7 wks') & (adata.obs.classLabel == 'sens'), 'TPclass'] = 't=7 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=7 wks') & (adata.obs.classLabel == 'res'), 'TPclass'] = 't=7 wks res'
+adata.obs.loc[(adata.obs.timepoint=='t=10 wks') & (adata.obs.classLabel == 'sens'), 'TPclass'] = 't=10 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=10 wks') & (adata.obs.classLabel == 'res'), 'TPclass'] = 't=10 wks res'
+
+sc.pl.umap(adata,color=['TPclass'])
+#
+sc.pl.umap(adata,color=['classLabel'])
+
+#%% Subset anndata into each time point: PRE TREATMENT
+adata_pre = adata[adata.obs['timepoint']=='t=0 wks', :]
+dfpre = pd.concat([adata_pre.obs['classLabel'],
+               pd.DataFrame(adata_pre.raw.X,index=adata_pre.obs.index,
+                            columns=adata_pre.var_names),], axis=1) 
+lin_list_pre = adata_pre.obs.lineage
+
+
+#sc.pl.umap(adata_pre,color='classLabel', palette = ['red', 'green']) 
+npre = len(dfpre)
+print(npre)
+ypreb = dfpre.classLabel=='res'
+ypre= ypreb*1
+phirpre = (sum(ypre))/npre
+print(phirpre)
+phispre = 1-phirpre
+print(phispre)
+#Plot for each time point cells projected into the principal component space
+Xpre = adata_pre.raw.X
+PCspre=pca.transform(Xpre)
+
+# Pre-treatment
+
+PCpredf = pd.DataFrame(PCspre)
+PCpredf.reset_index(drop=True, inplace=True)
+ypre.reset_index(drop=True, inplace=True)
+PCpredf['classlabel'] = ypre
+xp = np.asarray(PCpredf[0])
+yp = np.asarray(PCpredf[1])
+
+
+PCpredfs = PCpredf[PCpredf['classlabel']==0]
+PCpredfr = PCpredf[PCpredf['classlabel']==1]
+xpres= np.asarray(PCpredfs[0])
+ypres=np.asarray(PCpredfs[1])
+xprer= np.asarray(PCpredfr[0])
+yprer=np.asarray(PCpredfr[1])
+
+fig = plt.figure(figsize=(10,10))
+
+srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1) # label = 't=0 hr labeled sensitive')
+srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1)# label = 't=0 hr labeled resistant')
+
+pre_cells = plt.scatter(xp, yp, c='b', marker='o', alpha = 0.1)#, label = 't=0 hr remaining')
+#pres = plt.scatter(xpres, ypres, c='olivedrab', marker='+', alpha = 0.5) #label = 't=0 hr est sensitive')
+#prer = plt.scatter(xprer, yprer, c='pink', marker='+', alpha = 0.5)# label = 't=0 hr est resistant')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.grid(b=None)
+plt.ylim(-18, 28)
+plt.xlim(-18, 43)
+
+fig = plt.figure(figsize=(10,10))
+
+srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1) # label = 't=0 hr labeled sensitive')
+srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1)# label = 't=0 hr labeled resistant')
+
+#pre_cells = plt.scatter(xp, yp, c='b', marker='o', alpha = 0.1)#, label = 't=0 hr remaining')
+pres = plt.scatter(xpres, ypres, c='olivedrab', marker='+', alpha = 0.5) #label = 't=0 hr est sensitive')
+prer = plt.scatter(xprer, yprer, c='pink', marker='+', alpha = 0.5)# label = 't=0 hr est resistant')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.grid(b=None)
+plt.ylim(-18, 28)
+plt.xlim(-18, 43)
+#%% t= 7 weeks
+adata_post1 = adata[adata.obs['timepoint']=='t=7 wks', :]
+dfpost1= pd.concat([adata_post1.obs['classLabel'],
+               pd.DataFrame(adata_post1.raw.X,index=adata_post1.obs.index,
+                            columns=adata_post1.var_names),], axis=1) 
+sc.pl.umap(adata_post1,color='classLabel', palette = ['red', 'green']) 
+npost1 = len(dfpost1)
+print(npre)
+ypost1b = dfpost1.classLabel=='res'
+ypost1= ypost1b*1
+phirpost1 = (sum(ypost1))/npost1
+print(phirpost1)
+phispost1 = 1-phirpost1
+print(phispost1)
+# Also plot the principal components for each time point 
+Xpost1 = adata_post1.raw.X
+PCspost1=pca.transform(Xpost1)
+# Pre-treatment
+PCpost1df = pd.DataFrame(PCspost1)
+PCpost1df.reset_index(drop=True, inplace=True)
+ypost1.reset_index(drop=True, inplace=True)
+PCpost1df['classlabel'] = ypost1
+xpos1 = np.asarray(PCpost1df[0])
+ypos1 = np.asarray(PCpost1df[1])
+
+
+PCpost1dfs = PCpost1df[PCpost1df['classlabel']==0]
+PCpost1dfr = PCpost1df[PCpost1df['classlabel']==1]
+xpos1s= np.asarray(PCpost1dfs[0])
+ypos1s=np.asarray(PCpost1dfs[1])
+xpos1r= np.asarray(PCpost1dfr[0])
+ypos1r=np.asarray(PCpost1dfr[1])
+
+fig = plt.figure(figsize=(10,10))
+
+#srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1)# label = 't=0 hr labeled sensitive')
+#srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1)#, label = 't=0 hr labeled resistant')
+pres = plt.scatter(xpos1s, ypos1s, c='olivedrab', marker='+', alpha = 0.5) 
+prer = plt.scatter(xpos1r, ypos1r, c='pink', marker='+', alpha = 0.5)
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.grid(b=None)
+plt.ylim(-18, 28)
+plt.xlim(-18, 43)
+# %% Pull out the last time point and plot
+adata_post2 = adata[adata.obs['timepoint']=='t=10 wks', :]
+dfpost2= pd.concat([adata_post2.obs['classLabel'],
+               pd.DataFrame(adata_post2.raw.X,index=adata_post2.obs.index,
+                            columns=adata_post2.var_names),], axis=1) 
+sc.pl.umap(adata_post2,color='classLabel', palette = ['red', 'green']) 
+npost2 = len(dfpost2)
+print(npre)
+ypost2b = dfpost2.classLabel=='res'
+ypost2= ypost2b*1
+phirpost2 = (sum(ypost2))/npost2
+print(phirpost2)
+phispost2 = 1-phirpost2
+print(phispost2)
+
+# Also plot the principal components for each time point 
+Xpost2= adata_post2.raw.X
+PCspost2=pca.transform(Xpost2)
+# Pre-treatment
+PCpost2df = pd.DataFrame(PCspost2)
+PCpost2df.reset_index(drop=True, inplace=True)
+ypost2.reset_index(drop=True, inplace=True)
+PCpost2df['classlabel'] = ypost2
+xpos2= np.asarray(PCpost2df[0])
+ypos2= np.asarray(PCpost2df[1])
+
+
+PCpost2dfs = PCpost2df[PCpost2df['classlabel']==0]
+PCpost2dfr = PCpost2df[PCpost2df['classlabel']==1]
+xpos2s= np.asarray(PCpost2dfs[0])
+ypos2s=np.asarray(PCpost2dfs[1])
+xpos2r= np.asarray(PCpost2dfr[0])
+ypos2r=np.asarray(PCpost2dfr[1])
+
+fig = plt.figure(figsize=(10,10))
+
+#srs = plt.scatter(xsrs, ysrs, c='g', marker='^', alpha = 1)#, label = 't=0 hr labeled sensitive')
+#srr = plt.scatter(xsrr, ysrr, c='r', marker='^', alpha = 1)#, label = 't=0 hr labeled resistant')
+#post2_cells = plt.scatter(xpos2, ypos2, c='b', marker='o', alpha = 0.2, label = 't=1656 hr' )
+post2s = plt.scatter(xpos2s, ypos2s, c='olivedrab', marker='+', alpha = 0.5)#, label = 't=1176 hr est sensitive')
+post2r = plt.scatter(xpos2r, ypos2r, c='pink', marker='+', alpha = 0.5)#, label = 't=1176 hr est resistant')
+plt.xlabel('PC1')
+plt.ylabel('PC2')
+plt.grid(b=None)
+plt.ylim(-18, 28)
+plt.xlim(-20, 45)
+plt.legend(loc=1, prop={'size': 15})
+
+#%% Export the phi estimates
+phi_est= {'phi_t': [phispre, phispost1, phispost2],
+        't': [0, 1176, 1656],
+        'ncells': [npre,npost1,npost2]
+        }
+
+dfphi= DataFrame(phi_est, columns= ['phi_t', 't', 'ncells'])
+
+print(dfphi)
+
+dfphi.to_csv("phi_t_est_pythPCA.csv")
+
+
+filename = "phi_t_est_pythPCA.csv"
+path = "/Users/kj22643/Documents/Documents/Grant_dose_optimization/data"
+fullpath = os.path.join(path, filename)
+dfphi.to_csv("phi_t_est_pythPCA.csv")
+#%% Plot the UMAPS with each time point of estimates
+sc.pl.umap(adata,color='TPclass', palette = [ 'red', 'green', 'gray', 'gray', 'gray', 'gray',]) 
+sc.pl.umap(adata,color='TPclass', palette = ['gray', 'gray', 'red', 'green', 'gray', 'gray']) 
+sc.pl.umap(adata,color='TPclass', palette = ['gray', 'gray', 'gray', 'gray', 'red', 'green']) 
+
+
+#%% Find and plot the gene loadings and do differential analysis on these top genes
+
+# identify the top 10 components in PC1
+ordered_comp1=PC1.iloc[(-np.abs(components[0,:])).argsort()]
+x = -np.abs(components[0,:]);
+ind = np.unravel_index(np.argsort(x, axis=None), x.shape)
+
+
+indtop = ordered_comp1.index[0:50]
+
+ordered_comp2=PC2.iloc[(-np.abs(components[1,:])).argsort()]
+x2 = -np.abs(components[1,:]);
+ind2 = np.unravel_index(np.argsort(x2, axis=None), x2.shape)
+
+
+indtop = ordered_comp1.index[0:50]
+indtop2 = ordered_comp2.index[0:50]
+compdf1 = compdf.index==0
+compdf2 = compdf.index==1
+comps1 = compdf[compdf1]
+comps2 = compdf[compdf2]
+
+#%%
+
+fig = plt.figure(figsize=(5,5))
+plt.quiver(np.zeros(1), np.zeros(1),
+           comps1['UBE2S'], comps2['UBE2S'], angles='xy', scale_units='xy', scale =2, color = 'g')
+plt.quiver(np.zeros(1), np.zeros(1),
+           comps1['NEAT1'], comps2['NEAT1'], angles='xy', scale_units='xy', scale =2, color = 'r')
+plt.quiver(np.zeros(1), np.zeros(1),
+           comps1['TOP2A'], comps2['TOP2A'], angles='xy', scale_units='xy', scale =2, color = 'b')
+plt.quiver(np.zeros(1), np.zeros(1),
+           comps1['SGO2'], comps2['SGO2'], angles='xy', scale_units='xy', scale =2, color = 'c')
+plt.quiver(np.zeros(1), np.zeros(1),
+           comps1['FOSL1'], comps2['FOSL1'], angles='xy', scale_units='xy', scale =2, color = 'k')
+plt.quiver(np.zeros(1), np.zeros(1),
+           comps1['IL11'], comps2['IL11'], angles='xy', scale_units='xy', scale =2, color = 'y')
+plt.quiver(np.zeros(1), np.zeros(1),
+           comps1['FST'], comps2['FST'], angles='xy', scale_units='xy', scale =2, color = 'm')
+plt.quiver(np.zeros(1), np.zeros(1),
+           comps1['S100A4'], comps2['S100A4'], angles='xy', scale_units='xy', scale =2, color = 'chartreuse')
+plt.xlabel('Loadings PC1')
+plt.ylabel(' Loadings PC2')
+plt.grid(b=None)
+
+
+
+
+#%% Make an anndata object with only the top 100 genes
+adataselpre = adata_pre[:, indtop];
+adataselpresens = adataselpre.obs['classLabel']=='sens'
+adataselpreres = adataselpre.obs['classLabel'] == 'res'
+
+dfpresens = adataselpresens.mean(axis=0)
+#%%
+
+
+sc.pl.matrixplot(adata, indtop, groupby = 'TPclass', swap_axes = True, standard_scale = 'var', figsize = [5, 10])
+#%%
+sc.pl.matrixplot(adata, indtop, groupby = 'TPclass', swap_axes = True, standard_scale = 'var', figsize = [5, 10])
+sc.pl.matrixplot(adata, indtop2, groupby = 'TPclass', swap_axes = True, standard_scale = 'var', figsize = [5, 10])
+#%%
+sc.pl.matrixplot(adata, ['UBE2S', 'NEAT1', 'TOP2A', 'MKI67', 'AURKA', 'SGO2', 'CDK1', 'NUSAP1', 'KPNA2'], groupby = 'classLabel', swap_axes = True)
+sc.pl.matrixplot(adata, ['UBE2S', 'NEAT1', 'TOP2A', 'MKI67', 'AURKA', 'SGO2', 'CDK1', 'NUSAP1', 'KPNA2'], groupby = 'TPclass', swap_axes = True)
+

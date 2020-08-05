@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Sep 10 10:24:10 2019
+
+@author: kj22643
+"""
+
+%reset
+
+import numpy as np
+import pandas as pd
+import os
+import scanpy as sc
+import seaborn as sns
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.pyplot import plot, show, draw, figure, cm
+import matplotlib as plt
+import random
+from collections import OrderedDict
+import copy
+import math
+import matplotlib.pyplot as plt
+from pandas import DataFrame, Series
+import plotnine as gg
+import scipy as sp
+import scipy.stats as stats
+import sklearn as sk
+import sklearn.model_selection as model_selection
+from sklearn.model_selection import ShuffleSplit
+from sklearn.model_selection import StratifiedKFold
+import sklearn.feature_selection as feature_selection
+import sklearn.linear_model as linear_model
+import sklearn.pipeline as pipeline
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.cluster import KMeans
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn import svm
+from sklearn import metrics
+from sklearn.metrics import roc_curve, auc
+os.chdir('/Users/kj22643/Documents/Documents/231_Classifier_Project/code')
+from func_file import find_mean_AUC
+from func_file import find_mean_AUC_SVM
+
+
+
+path = '/Users/kj22643/Documents/Documents/231_Classifier_Project/data'
+#path = '/stor/scratch/Brock/231_10X_data/'
+os.chdir(path)
+sc.settings.figdir = 'KJ_plots'
+sc.set_figure_params(dpi_save=300)
+sc.settings.verbosity = 3
+
+#%% Load in pre and post treatment 231 data
+adata = sc.read('post-cell-cycle-regress.h5ad')
+adata.obs.head()
+# current samples:
+#BgL1K
+#Rel-1 AA107 7 weeks
+#Rel-2 AA113  10 weeks - 1 day
+# We will change these to time points
+# Count the number of unique lineages in all the cells
+uniquelins = adata.obs['lineage'].unique()
+nunique = len(uniquelins)
+
+samps= adata.obs['sample'].unique()
+
+#%% Identify lineages that have been recalled from the pre-treatment sample
+# Make a column labeled recalled lin that can be use to identify the specific lineages of interest
+
+# These correspond to AA161 and AA170
+# AA170 is the highly proliferative lineage that ultimately decreases in lineage abundance
+# AA161 is a lowly abundant in the pre-treatment but is one of the ones that comes
+# to  be highly abundance in both post treatment samples
+
+reslin = ['GTACATTTTCATACCTCTCG']
+senslin = ['GTGTGTTGTTTTTGTACGGC']
+
+
+adata.obs.loc[adata.obs.lineage.isin(reslin)==True,'recalled_lin'] = 'res'
+adata.obs.loc[adata.obs.lineage.isin(reslin)==False,'recalled_lin'] = 'na'
+adata.obs.loc[adata.obs.lineage.isin(senslin)==True,'recalled_lin'] = 'sens'
+
+print(adata.obs['recalled_lin'])
+#%% Add a column to rename the samples by time point
+samps= adata.obs['sample'].unique()
+
+timepoint = np.array(['t=0 wks', 't=7 wks', 't=10 wks'])
+
+adata.obs.loc[adata.obs['sample']==samps[0], 'timepoint']='t=0 wks'
+adata.obs.loc[adata.obs['sample']==samps[1], 'timepoint']='t=7 wks'
+adata.obs.loc[adata.obs['sample']==samps[2], 'timepoint']='t=10 wks'
+
+print(adata.obs['timepoint'].unique())
+
+TP = np.array(['pre', 'post'])
+
+adata.obs.loc[adata.obs['sample']==samps[0], 'TP']='pre'
+adata.obs.loc[adata.obs['sample']==samps[1], 'TP']='post'
+adata.obs.loc[adata.obs['sample']==samps[2], 'TP']='post'
+
+
+sc.pl.umap(adata,color='timepoint',palette=['#a00101','#f79d02','#00c6c6'])
+sc.pl.umap(adata,color='recalled_lin',palette=['#a00101','#f79d02','#00c6c6'])                                         
+
+#%% Separately make dataframes for the pre-treatment, intermediate, and post treatment samples
+# t=0 hr (pre-treatment), 3182 pre treatment cells
+# We want to keep the info about the lineage so we can potentially
+# use it to make evenly divided testing and training data sets
+dfall = pd.concat([adata.obs['lineage'],adata.obs['timepoint'], 
+               pd.DataFrame(adata.raw.X,index=adata.obs.index,
+                            columns=adata.var_names),], axis=1) 
+ncells = len(dfall)
+print(ncells)
+adata_pre = adata[adata.obs['timepoint']=='t=0 wks', :]
+dfpre = pd.concat([adata_pre.obs['lineage'], adata_pre.obs['recalled_lin'],
+               pd.DataFrame(adata_pre.raw.X,index=adata_pre.obs.index,
+                            columns=adata_pre.var_names),], axis=1) 
+sc.pl.umap(adata_pre,color='recalled_lin',palette=['#a00101','#f79d02','#00c6c6']) 
+npre = len(dfpre)
+print(npre)
+
+# t=1176 hr (~roughly 7 weeks), 10332 post treatment cells
+adata_post1 = adata[adata.obs['timepoint']=='t=7 wks', :]
+dfpost1 = pd.concat([adata_post1.obs['lineage'], adata_post1.obs['recalled_lin'],
+                    pd.DataFrame(adata_post1.raw.X, index=adata_post1.obs.index, 
+                                 columns = adata_post1.var_names),],axis =1)
+npost1 = len(dfpost1)
+print(npost1)
+adata_post2 = adata[adata.obs['timepoint']=='t=10 wks', :]
+dfpost2= pd.concat([adata_post2.obs['lineage'], adata_post2.obs['recalled_lin'],
+                    pd.DataFrame(adata_post2.raw.X, index=adata_post2.obs.index, 
+                                 columns = adata_post2.var_names),],axis =1)
+npost2 = len(dfpost2)
+print(npost2)
+
+adata_POST= adata[adata.obs['TP']=='post', :]
+dfPOST= pd.concat([adata_POST.obs['lineage'], adata_POST.obs['recalled_lin'],
+                    pd.DataFrame(adata_POST.raw.X, index=adata_POST.obs.index, 
+                                 columns = adata_POST.var_names),],axis =1)
+nPOST= len(dfPOST)
+print(nPOST)
+#%% Try to add a .obs column that records lineage abundance from the different samples
+# The result of this is that index becomes the lineage and the lineage column becomes the value count
+
+linAbundpre= adata_pre.obs['lineage'].value_counts()
+# Want the linabundpost from the combined post-treatment samples
+linAbundpost = adata_POST.obs['lineage'].value_counts()
+
+# Start by adding the linabundpre and lin abund post to the pre-treatment data frame
+df1 = pd.DataFrame(linAbundpre)
+df1['linabundpre']= df1.lineage
+df1=df1.drop(['lineage'], axis=1)
+df1['lineage'] = df1.index
+df1=df1.drop(index='nan')
+
+
+df2 = pd.DataFrame(linAbundpost)
+df2['linabundpost']= df2.lineage
+df2=df2.drop(['lineage'], axis=1)
+df2['lineage'] = df2.index
+df2=df2.drop(index='nan')
+#  Merge the linage abundance data frames from the pre and post treatment samples into dfpre
+dfpre= pd.DataFrame.merge(df1, dfpre, left_on=['lineage'], 
+              right_on=['lineage'], how='right')
+dfpre = pd.DataFrame.merge(df2, dfpre, left_on=['lineage'],
+              right_on=['lineage'], how='right') 
+dfpre['linabundpost'] = dfpre['linabundpost'].fillna(0)
+dfpre['linabundpre']= dfpre['linabundpre'].fillna(0)
+
+dfpre['linproppost'] = dfpre['linabundpost']/nPOST
+dfpre['linproppre'] = dfpre['linabundpre']/npre
+
+dfpre['linpropchange'] = (dfpre['linproppost']-dfpre['linproppre'])
+linpropchangevec = dfpre['linpropchange']
+plt.figure()
+plt.hist(dfpre['linpropchange'], bins = 100)
+plt.xlabel(' Change in Lineage Abundance (% of post- % of pre)')
+plt.ylabel('Number of Cells in Pre-treatment Sample')
+
+
+#%% Make a column that is the logfoldchange from post to pre
+
+dfpre['foldchange'] =  (dfpre['linabundpost']-dfpre['linabundpre'])
+#dfpre['foldchange'] =  ((dfpre['linabundpost']/npost)-(dfpre['linabundpre']/npre))/(dfpre['linabundpre']/npre)
+print(dfpre['foldchange'].unique())
+foldchangevec = dfpre['foldchange']
+#%% Look at fold change and log fold change for each cell and its correpsonding lineage
+dfpre['logfoldchange'] = np.log(dfpre['foldchange'])
+dfpre['logfoldchange']= dfpre['logfoldchange'].fillna(0)
+
+
+print(dfpre['logfoldchange'].unique())
+
+# Figures of logfold change and fold change
+plt.figure()
+plt.hist(dfpre['logfoldchange'], range = [3, 7], bins = 100)
+plt.xlabel('log(foldchange) of lineage abundance')
+plt.ylabel('number of cells')
+
+plt.figure()
+plt.hist(dfpre['foldchange'],range = [0, 500], bins = 100)
+plt.xlabel('foldchange of lineage abundance')
+plt.ylabel('number of cells')
+
+#%% Make the survivor column in the pre-treatment data based on linpropchange 
+#dfpre['survivor'] =np.where(dfpre['linabundpost'] >1000, 'res','sens'
+# Want to call cells that have an increase in lineage abundance resistant
+dfpre.loc[dfpre.linpropchange>0, 'survivor'] = 'res'
+
+dfpre.loc[dfpre.linpropchange<-0.05, 'survivor']= 'sens' # make a strict cutoff of wer're sure it decreases significantly
+#dfpre.loc[dfpre.foldchange<-0.7, 'survivor']= 'sens'
+survivorvec = dfpre['survivor']
+
+
+# Want to call cells that have an signficant in lineage abundance resistant
+
+# Make a dataframe that only contains cells who are given a sens or resistant label
+
+dfsr = dfpre[(dfpre['survivor']=='sens') | (dfpre['survivor'] == 'res')]
+nclass = len(dfsr)
+print(nclass)
+y= pd.factorize(dfsr['survivor'])[0] 
+y ^= 1
+mu_sr = sum(y)/len(y)
+print(mu_sr)
+Xsr = dfsr.drop(columns= [ 'lineage', 'linabundpost', 'recalled_lin', 'linabundpre', 'linproppost', 'linproppre', 'linpropchange', 'foldchange', 'logfoldchange', 'survivor'])
+
+#%% Run PCA on labeled data set
+X = Xsr
+full_dict = {'fullmat':{}, 'prev':{}, 'labels':{}, 'V':{}, 'lambdas':{}, 'varPC':{}}
+n_neighbors = 90
+n_components = 500
+random_state = 0
+
+pca=PCA(copy=True, iterated_power='auto', n_components=500, random_state=0,
+  svd_solver='auto', tol=0.0, whiten=False)
+V = pca.fit(X)  
+varPC= (pca.explained_variance_ratio_)  
+
+lambdas = pca.singular_values_ 
+full_dict['full_mat'] = X
+full_dict['labels']=y
+full_dict['V']= V
+full_dict['varPC']= varPC
+
+
+
+# X is your cell gene matrix, y is your class labels
+#%%
+# Split into train/test
+kCV = 5
+skf = StratifiedKFold(n_splits=kCV, shuffle= True)
+Atrain = {}
+Atest = {}
+ytest = {}
+ytrain = {}
+proprestest = {}
+proprestrain = {}
+
+folds_dict = {'trainmat':{}, 'trainlabel':{}, 'eigenvectors':{}, 'eigvals':{}, 'meanvec':{}}
+for i in range(kCV):    
+    for train_index, test_index in skf.split(X, y):
+        Atrain[i] = X.iloc[train_index, :]
+        Atest[i] = X.iloc[test_index, :]
+        ytest[i]= y[test_index]
+        ytrain[i]= y[train_index]
+        proprestest[i] = sum(ytest[i])/len(ytest[i])
+        proprestrain[i] = sum(ytrain[i])/len(ytrain[i])
+         
+# Save all of your stratified folds into a single dictionary. 
+folds_dict['trainmat'] = Atrain
+folds_dict['trainlabel']= ytrain
+folds_dict['testmat'] = Atest
+folds_dict['testlabel'] = ytest
+folds_dict['prevtest'] = proprestest
+folds_dict['prevtrain']= proprestrain
+
+
+
+n_classes = len(np.unique(y))
+      
+
+
+# Use a nearest neighbor classifier to evaluate the methods
+knn = KNeighborsClassifier(n_neighbors=n_neighbors)
+
+pca=PCA(copy=True, iterated_power='auto', n_components=n_components, random_state=0,
+            svd_solver='auto', tol=0.0, whiten=False)
+
+#%% #Compute the ROC curve for each fold
+
+
+AUC=np.zeros((kCV,1))
+acc = np.zeros((kCV,1))
+for i in range(kCV):
+    X_train = folds_dict['trainmat'][i]
+    y_train = folds_dict['trainlabel'][i]
+    X_test = folds_dict['testmat'][i]
+    y_test = folds_dict['testlabel'][i]
+    
+    # Build new model based on training data set
+    pca.fit(X_train, y_train)
+    V_train = pca.fit_transform(X_train)
+# Fit a nearest neighbor classifier on the model built on the training data set
+    knn.fit(pca.transform(X_train), y_train)
+    prob_scores = knn.predict_proba(pca.transform(X_test))
+# Compute the nearest neighbor accuracy on the embedded test set
+    acc_knn = knn.score(pca.transform(X_test), y_test)
+    acc[i]=acc_knn
+    fpr, tpr, thresholds = metrics.roc_curve(y_test, prob_scores[:,1], pos_label=1)
+    roc_auc = auc(fpr, tpr)
+    plt.figure()
+    lw = 2
+    plt.plot(fpr, tpr, color='darkorange',
+         lw=lw, label='ROC curve (area = %0.2f)' % roc_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve from k-fold CV')
+    plt.legend(loc="lower right")
+    plt.show()
+
+    AUC[i]= roc_auc
+  
+plt.figure()
+plt.plot(np.linspace(0,4, num=kCV), AUC)
+plt.ylim([0.5, 1.05])
+plt.xlabel('fold')
+plt.ylabel('AUC')
+plt.title('AUC for each fold')
+plt.show()
+
+meanAUC_PCA = AUC.mean()
+
+#%% Test function call
+os.chdir('/Users/kj22643/Documents/Documents/231_Classifier_Project/code')
+from func_file import find_mean_AUC
+
+meanAUCtest = find_mean_AUC(folds_dict, n_neighbors, n_components)
+print(meanAUCtest)
+#%% ITERATIVE COORDINATE OPTIMIZATION
+# Start by optimizing number of neighbors  holding number of components constant
+
+n_neighborsvec = np.linspace(1,250,num = 25)
+meanAUC_neighbs = np.zeros((len(n_neighborsvec),1))
+
+for i in range(len(n_neighborsvec)):
+    meanAUC_neighbs[i]=find_mean_AUC(folds_dict, int(n_neighborsvec[i]), n_components)
+
+plt.figure()
+plt.plot(n_neighborsvec, meanAUC_neighbs)
+plt.xlabel('k nearest neighbors')
+plt.ylabel('mean AUC')
+plt.title('Optimizine knn Iteration 1')
+plt.show()
+
+indexmax = np.argmax(meanAUC_neighbs)
+nneighbsopt1 = int(n_neighborsvec[indexmax])
+# Run loop to vary the number of components
+#n_neighbors = int(nneighbsopt)
+n_compsvec = [2, 3, 5, 10, 20, 35, 50, 75, 100, 250, 500, 600]
+meanAUC_comps = np.zeros((len(n_compsvec),1))
+for i in range(len(n_compsvec)):
+    meanAUC_comps[i]=find_mean_AUC(folds_dict, nneighbsopt1, n_compsvec[i])
+
+indexmaxc = np.argmax(meanAUC_comps)
+ncompsopt1 = n_compsvec[indexmaxc]
+  
+plt.figure()
+plt.plot(n_compsvec, meanAUC_comps)
+plt.xlabel('Number of principal components')
+plt.ylabel('mean AUC')
+plt.title('Optimizine PCs Iteration 1')
+plt.show()
+
+# Run loop to vary the number of neighbors again
+
+n_neighborsvec = np.linspace(1,250,num = 25)
+meanAUC_neighbs = np.zeros((len(n_neighborsvec),1))
+
+for i in range(len(n_neighborsvec)):
+    meanAUC_neighbs[i]=find_mean_AUC(folds_dict, int(n_neighborsvec[i]), ncompsopt1)
+
+plt.figure()
+plt.plot(n_neighborsvec, meanAUC_neighbs)
+plt.xlabel('k nearest neighbors')
+plt.ylabel('mean AUC')
+plt.title('Optimizine knn Iteration 2')
+plt.show()
+
+# Use the optimal number of neighbors from this analysis to then find the optimal number of principal components...
+indexmax = np.argmax(meanAUC_neighbs)
+nneighbsopt2 = int(n_neighborsvec[indexmax])
+
+# Run loop to vary the number of components again
+
+n_compsvec = [2, 3, 5, 10, 20, 35, 50, 75, 100, 250, 500, 600]
+meanAUC_comps = np.zeros((len(n_compsvec),1))
+for i in range(len(n_compsvec)):
+    meanAUC_comps[i]=find_mean_AUC(folds_dict, nneighbsopt2, n_compsvec[i])
+
+indexmaxc = np.argmax(meanAUC_comps)
+ncompsopt2 = n_compsvec[indexmaxc]
+ 
+plt.figure()
+plt.plot(n_compsvec, meanAUC_comps)
+plt.xlabel('Number of principal components')
+plt.ylabel('mean AUC')
+plt.title('Optimizne PCs Iteration 2')
+plt.show()
+
+
+
+#%% Set the number of neighbors and number of components to the two optimal values
+# and generate the ROC curve
+
+n_components = int(ncompsopt2)
+n_neighbors = int(nneighbsopt2)
+
+# Use a nearest neighbor classifier to evaluate the methods
+knn = KNeighborsClassifier(n_neighbors=n_neighbors)
+
+pca=PCA(copy=True, iterated_power='auto', n_components=n_components, random_state=0,
+            svd_solver='auto', tol=0.0, whiten=False)
+
+
+X_train = folds_dict['trainmat'][1]
+y_train = folds_dict['trainlabel'][1]
+X_test = folds_dict['testmat'][1]
+y_test = folds_dict['testlabel'][1]
+    
+    # Build new model based on training data set
+pca.fit(X_train, y_train)
+V_train = pca.fit_transform(X_train)
+# Fit a nearest neighbor classifier on the model built on the training data set
+knn.fit(pca.transform(X_train), y_train)
+prob_scores = knn.predict_proba(pca.transform(X_test))
+# Compute the nearest neighbor accuracy on the embedded test set
+acc_knn = knn.score(pca.transform(X_test), y_test)
+acc[1]=acc_knn
+fpr, tpr, thresholds = metrics.roc_curve(y_test, prob_scores[:,1], pos_label=1)
+roc_auc = auc(fpr, tpr)
+plt.figure()
+lw = 2
+plt.plot(fpr, tpr, color='darkorange',
+        lw=lw, label='ROC curve (area = %0.2f)' % roc_auc)
+plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+#plt.title('ROC Curve k=32, nPCs = 100')
+plt.legend(loc="lower right")
+plt.show()
+
+AUC_opt= roc_auc
+
+mean_AUC_opt = find_mean_AUC(folds_dict, n_neighbors, n_components)

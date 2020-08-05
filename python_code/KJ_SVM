@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jul 23 16:00:13 2020
+
+@author: kj22643
+"""
+
+# This script runs Linear SVM on the data and generates the figures with class
+# estimates of S and R cells
+%reset
+
+import numpy as np
+import pandas as pd
+import os
+import scanpy as sc
+import seaborn as sns
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.pyplot import plot, show, draw, figure, cm
+import matplotlib as plt
+import random
+from collections import OrderedDict
+import copy
+import math
+import matplotlib.pyplot as plt
+from pandas import DataFrame, Series
+import plotnine as gg
+import scipy as sp
+import scipy.stats as stats
+import sklearn as sk
+import sklearn.model_selection as model_selection
+from sklearn.model_selection import ShuffleSplit
+from sklearn.model_selection import StratifiedKFold
+import sklearn.feature_selection as feature_selection
+import sklearn.linear_model as linear_model
+import sklearn.pipeline as pipeline
+import csv
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.cluster import KMeans
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn import svm
+from sklearn.svm import LinearSVC      
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn import metrics
+from sklearn.metrics import roc_curve, auc
+os.chdir('/Users/kj22643/Documents/Documents/231_Classifier_Project/code')
+from func_file import find_mean_AUC
+from func_file import find_mean_AUC_SVM
+
+
+# Set path to the folder containing the scRNAseq data
+path = '/Users/kj22643/Documents/Documents/231_Classifier_Project/data'
+#path = '/stor/scratch/Brock/231_10X_data/'
+os.chdir(path)
+sc.settings.figdir = 'KJ_plots'
+sc.set_figure_params(dpi_save=300)
+sc.settings.verbosity = 3
+
+#%% Load in normalized scRNAseq data from all time points
+adata = sc.read('post-cell-cycle-regress.h5ad')
+adata.obs.head()
+# Note: adata object contains additional column of lineage abundance info. 
+# this will be used to identify sensitive and resistant cells in the pre-
+# treatment time point. Also contains column for the sample number, which
+# corresponds to the time point
+uniquelins = adata.obs['lineage'].unique()
+nunique = len(uniquelins)
+
+# Name samples by their time point  (0, 7, 10 weeks and pre/post)
+samps= adata.obs['sample'].unique()
+
+timepoint = np.array(['t=0 wks', 't=7 wks', 't=10 wks'])
+adata.obs.loc[adata.obs['sample']==samps[0], 'timepoint']='t=0 wks'
+adata.obs.loc[adata.obs['sample']==samps[1], 'timepoint']='t=7 wks'
+adata.obs.loc[adata.obs['sample']==samps[2], 'timepoint']='t=10 wks'
+
+TP = np.array(['pre', 'post'])
+adata.obs.loc[adata.obs['sample']==samps[0], 'TP']='pre'
+adata.obs.loc[adata.obs['sample']==samps[1], 'TP']='post'
+adata.obs.loc[adata.obs['sample']==samps[2], 'TP']='post'
+
+# Plot all data in a umap colored by timepoint
+sc.pl.umap(adata,color='timepoint',palette=['#f79d02', '#d604f7', '#00c6c6'])
+
+  
+#%% Calculate the pre and post treatment lineage abundances
+# lineage counts = the number of cells in a lineage
+# lineage abundance = the proportion of a population the cells in that lineage
+# take up at a specific time point.
+# Calculate the magnitude of change in lineage abundance
+# change_i = abund_post_i - abund_pre_i
+
+
+lincountspre= adata.obs.loc[adata.obs.TP=='pre','lineage'].value_counts()
+lincountspost= adata.obs.loc[adata.obs.TP=='post','lineage'].value_counts()
+
+npre = sum(lincountspre)
+npost=sum (lincountspost)
+linabundpre = lincountspre/npre
+linabundpost = lincountspost/npost
+# Put into a dictionary to compare the lineage abundances at each time point
+dpost = linabundpost.to_dict()
+dpre = linabundpre.to_dict()
+# dchange = the change in lineage abundance from pre to post of an individual lineage
+# key = lineage, val = change in lineage abundance
+dchange = {key: dpost[key] - dpre.get(key, 0) for key in dpost.keys()}
+# save this dictionary into the anndata object
+adata.uns['linabundchange'] = dchange
+linabundchange = adata.uns['linabundchange']
+# output these lists of lineage abundances to csv files
+a_file = open("linabundchange.csv", "w")
+writer = csv.writer(a_file)
+for key, value in linabundchange.items():
+    writer.writerow([key, value])
+    
+a_file.close()
+linabundpre.to_csv("linabundpre.csv")
+filename = "linabundpre.csv"
+linabundpost.to_csv("linabundpost.csv")
+filename = "linabundpost.csv"
+#%%Map the lineages in dchange to the cells in the anndata object
+# each cell now is labeled by the amount its lineage changes post treatment
+adata.obs['linabundchange']= adata.obs['lineage'].map(dchange)
+# Set the threshold for calling cells sensitive or resistant, pulling from only
+# the lineages with greatest increase (R) or decrease (S) in abundance 
+S_threshold = 0.05
+R_threshold = 0
+# Plot the change in lineage abundance distribution                                       
+plt.figure()
+plt.hist(adata.obs.loc[adata.obs.timepoint == 't=0 wks','linabundchange'], bins = 100)
+plt.plot([R_threshold,R_threshold], [0,900], c='r', alpha = 1)
+plt.plot([-S_threshold, -S_threshold],[0,900], c='g', alpha = 1)
+plt.xlabel(' Change in lineage abundance')
+plt.ylabel('Number of cells in the lineage')
+plt.title('Distribution of lineage abundance change')
+#plt.legend(loc=1, prop={'size': 15})     
+plt.ylim(0, 900)
+plt.xlim(-0.5, 0.5)
+plt.grid(b=None)
+                                    
+
+#%% Make the sensitive and resistant labels within your anndata object
+
+# Label the cells and differentiate by estimate 
+#classEst = np.array(['training set R', 'training set S', 'unknown', 'estimated R', 'estimated S'])
+#adata.obs.loc[adata.obs.timepoint=='t=0 wks','classEst'] = 'unknown'
+#adata.obs.loc[adata.obs.timepoint=='t=7 wks','classEst'] = 'unknown'
+#adata.obs.loc[adata.obs.timepoint=='t=10 wks','classEst'] = 'unknown'
+#adata.obs.loc[(adata.obs.linabundchange>R_threshold)&(adata.obs.timepoint=='t=0 wks'), 'classEst'] = 'training set R'
+#adata.obs.loc[(adata.obs.linabundchange<-S_threshold)&(adata.obs.timepoint=='t=0 wks'), 'classEst'] = 'training set S'
+#adata.obs.loc[adata.obs.lineage=='nan', 'classEst'] = 'unknown'
+
+# Label the cells just by S and R
+classLabel = np.array(['res', 'sens', 'unknown',])
+adata.obs.loc[adata.obs.timepoint=='t=0 wks','classLabel'] = 'unknown'
+adata.obs.loc[adata.obs.timepoint=='t=7 wks','classLabel'] = 'unknown'
+adata.obs.loc[adata.obs.timepoint=='t=10 wks','classLabel'] = 'unknown'
+adata.obs.loc[(adata.obs.linabundchange>R_threshold)&(adata.obs.timepoint=='t=0 wks'), 'classLabel'] = 'res'
+adata.obs.loc[(adata.obs.linabundchange<-S_threshold)&(adata.obs.timepoint=='t=0 wks'), 'classLabel'] = 'sens'
+adata.obs.loc[adata.obs.lineage=='nan', 'classLabel'] = 'unknown'
+#adata.obs.loc[(adata.obs.linpropchange<-0.5)&(adata.obs.timepoint=='t=0hr'), 'classLabel'] = 'sens'
+
+# plot the labeled cells alongside unknown cells and alone on same axes.
+sc.pl.umap(adata,color='classLabel', palette = ['red', 'green', 'gray'])
+#sc.pl.umap(adata,color='classEst', palette = ['red', 'green', 'gray'])
+sc.pl.umap(adata,color='classLabel', palette = ['red', 'green', 'white'])
+
+
+#%% Now we want to take out only the data that is labeled as res and sens 
+# and test the classifier on the labeled dataset
+adata_sr= adata[(adata.obs['classLabel']=='res')|(adata.obs['classLabel']=='sens'), :]
+dfsr= pd.concat([adata_sr.obs['lineage'],adata_sr.obs['classLabel'],
+               pd.DataFrame(adata_sr.raw.X,index=adata_sr.obs.index,
+                            columns=adata_sr.var_names),], axis=1) 
+# plot only the labeled cells
+sc.pl.umap(adata_sr,color='classLabel',palette=['red', 'green']) 
+
+nsr= len(dfsr)
+y= pd.factorize(dfsr['classLabel'])[0] 
+nres = sum(y)
+mu_sr = sum(y)/len(y) # shows how we have unbalanced class sizes
+print(mu_sr)
+# Xsr is your cell gene matrix, y is your class labels
+Xsr = dfsr.drop(columns= [ 'classLabel', 'lineage'])
+
+
+
+# %%Assign the parameters for Linear SVM and fit the models
+
+
+
+# SET UP SVM
+Copt = 1
+clf = svm.LinearSVC( C=Copt)
+linear_svc = LinearSVC()
+
+# FIT SVM
+clf.fit(Xsr, y)
+clf = linear_svc.fit(Xsr, y)
+calibrated_svc = CalibratedClassifierCV(base_estimator = linear_svc, cv= "prefit")
+calibrated_svc.fit(Xsr, y)
+predicted = calibrated_svc.predict(Xsr)
+prob = calibrated_svc.predict_proba(Xsr)
+weights = clf.coef_
+weightsdf = pd.DataFrame(weights, columns = adata_sr.var_names)
+adata.uns['weights'] = weightsdf
+
+
+
+
+
+#%% Generate ROC curve to determine the best threshold for deciding on class
+
+#%FOR SVM
+clf = linear_svc.fit(Xsr, y)
+calibrated_svc = CalibratedClassifierCV(base_estimator = linear_svc, cv= "prefit")
+calibrated_svc.fit(Xsr, y)
+predicted = calibrated_svc.predict(Xsr)
+prob = calibrated_svc.predict_proba(Xsr)
+
+
+fpr, tpr, thresholds = metrics.roc_curve(y, prob[:,1], pos_label=1)
+roc_auc = auc(fpr, tpr)
+
+plt.figure()
+lw = 2
+plt.plot(fpr, tpr, color='navy',
+         lw=lw, label='ROC curve (area = %0.2f)' % roc_auc)
+plt.plot([0, 1], [0, 1], color='black', lw=lw, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve labeled data Linear SVM')
+plt.legend(loc="lower right")
+plt.grid(b=None)
+plt.show()
+
+
+# This tells us that the classes are very separable, and so really any reasonable
+# threshold should be able to separate the classes.
+# This completes the goal of this script- to determine the classifier and 
+# justify the use of any threshold.
+
+
+
+
+
+
+
+
+
+
+
+
+# %% Apply SVM to data,
+adata_unk= adata[(adata.obs['classLabel']=='unknown'), :]
+# Make a data frame with just the raw gene-cell matrix but keep the cell identity
+Xunk = pd.DataFrame(adata_unk.raw.X,index=adata_unk.obs.index,
+                            columns=adata_unk.var_names)
+
+clf = linear_svc.fit(Xsr, y)
+calibrated_svc = CalibratedClassifierCV(base_estimator = linear_svc, cv= "prefit")
+calibrated_svc.fit(Xsr, y)
+predicted = calibrated_svc.predict(Xunk)
+prob = calibrated_svc.predict_proba(Xunk) # output a probability of being in each class
+
+
+
+#%% Vary the threshold probability 
+thres_prob = 0.9
+B = prob[:,1]>thres_prob
+y_est=B*1
+
+#%%
+#  Try mapping outcomes
+
+# first make an indexed data frame
+class_est= pd.DataFrame(y_est, index = adata_unk.obs.index)
+class_est.columns=['est']
+adata.obs['class_est'] = adata.obs.index.map(class_est.est)
+sc.pl.umap(adata,color=['class_est'])
+
+classEst2 = np.array(['training set S', 'training set R', 'estimated S', 'estimated R'])
+adata.obs.loc[(adata.obs.class_est==1), 'ClassEst'] = 'estimated R'
+adata.obs.loc[(adata.obs.class_est==0), 'ClassEst'] = 'estimated S'
+adata.obs.loc[(adata.obs.classLabel=='res'), 'ClassEst'] = 'training set R'
+adata.obs.loc[(adata.obs.classLabel=='sens'), 'ClassEst'] = 'training set S'
+
+reslin = ['GTACATTTTCATACCTCTCG']
+senslin = ['GTGTGTTGTTTTTGTACGGC']
+
+
+adata.obs.loc[adata.obs.lineage.isin(reslin)==True,'recalled_lin'] = 'res_lin'
+adata.obs.loc[adata.obs.lineage.isin(reslin)==False,'recalled_lin'] = 'na'
+adata.obs.loc[adata.obs.lineage.isin(senslin)==True,'recalled_lin'] = 'sens_lin'
+
+
+
+print(adata.obs['recalled_lin'])
+
+classEst2 = np.array(['training set S', 'training set R', 'estimated S', 'estimated R'])
+adata.obs.loc[(adata.obs.class_est==1), 'ClassEst'] = 'estimated R'
+adata.obs.loc[(adata.obs.class_est==0), 'ClassEst'] = 'estimated S'
+adata.obs.loc[(adata.obs.classLabel=='res'), 'ClassEst'] = 'training set R'
+adata.obs.loc[(adata.obs.classLabel=='sens'), 'ClassEst'] = 'training set S'
+
+# add the labeled to ann data object
+adata.obs.loc[adata.obs.class_est==1, 'classLabel'] = 'res'
+adata.obs.loc[adata.obs.class_est==0, 'classLabel'] = 'sens'
+#adata.obs.loc[adata.obs.class_est==1, 'classEst'] = 'estimated R'
+#adata.obs.loc[adata.obs.class_est==0, 'classEst'] = 'estimated S'
+# Make a new .obs variable that divides into time point and class label
+TPclass = np.array(['training set S', 'training set R', 't=0 wks sens', 
+                    't=0 wks res', 't=7 wks sens','t=7 wks res', 
+                    't=10 wks sens', 't=10 wks res'])
+
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.ClassEst == 'training set S'), 'TPclass'] = 'training set S'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.ClassEst == 'training set R'), 'TPclass'] = 'training set R'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.ClassEst == 'estimated S'), 'TPclass'] = 't=0 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.ClassEst == 'estimated R'), 'TPclass'] = 't=0 wks res'
+adata.obs.loc[(adata.obs.timepoint=='t=7 wks') & (adata.obs.ClassEst == 'estimated S'), 'TPclass'] = 't=7 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=7 wks') & (adata.obs.ClassEst == 'estimated R'), 'TPclass'] = 't=7 wks res'
+adata.obs.loc[(adata.obs.timepoint=='t=10 wks') & (adata.obs.ClassEst == 'estimated S'), 'TPclass'] = 't=10 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=10 wks') & (adata.obs.ClassEst == 'estimated R'), 'TPclass'] = 't=10 wks res'
+
+TPclasslin = np.array(['training set S', 'training set R', 't=0 wks sens', 
+                    't=0 wks res', 't=7 wks sens','t=7 wks res', 
+                    't=10 wks sens', 't=10 wks res', 't=0 res lin', 't=0 sens lin'])
+
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.ClassEst == 'training set S'), 'TPclasslin'] = 'training set S'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.ClassEst == 'training set R'), 'TPclasslin'] = 'training set R'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.ClassEst == 'estimated S'), 'TPclasslin'] = 't=0 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.ClassEst == 'estimated R'), 'TPclasslin'] = 't=0 wks res'
+adata.obs.loc[(adata.obs.timepoint=='t=7 wks') & (adata.obs.ClassEst == 'estimated S'), 'TPclasslin'] = 't=7 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=7 wks') & (adata.obs.ClassEst == 'estimated R'), 'TPclasslin'] = 't=7 wks res'
+adata.obs.loc[(adata.obs.timepoint=='t=10 wks') & (adata.obs.ClassEst == 'estimated S'), 'TPclasslin'] = 't=10 wks sens'
+adata.obs.loc[(adata.obs.timepoint=='t=10 wks') & (adata.obs.ClassEst == 'estimated R'), 'TPclasslin'] = 't=10 wks res'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.recalled_lin == 'res_lin'), 'TPclasslin'] = 't=0 res lin'
+adata.obs.loc[(adata.obs.timepoint=='t=0 wks') & (adata.obs.recalled_lin == 'sens_lin'), 'TPclasslin'] = 't=0 sens lin'
+#%%
+sc.pl.umap(adata,color=['TPclass'])
+sc.pl.umap(adata,color=['classLabel'])
+sc.pl.umap(adata,color='classLabel', palette = ['red', 'green'])
+sc.pl.umap(adata,color='ClassEst', palette = [ 'olivedrab','pink', 'red', 'green'])
+sc.pl.umap(adata,color='TPclass', palette = [ 'olivedrab','pink', 'gray', 'gray', 'gray', 'gray', 'red', 'green'])
+sc.pl.umap(adata,color='TPclass', palette = [ 'gray', 'gray',  'olivedrab','pink', 'gray', 'gray', 'red', 'green'])
+sc.pl.umap(adata,color='TPclass', palette = [ 'gray','gray', 'gray', 'gray', 'olivedrab','pink','red', 'green'])
+#%%
+sc.pl.umap(adata,color='TPclasslin', palette = [ 'magenta', 'lime', 'olivedrab','pink', 'gray', 'gray', 'gray', 'gray', 'red', 'green'])
+#%%
+
+adata_pre = adata[adata.obs['timepoint']=='t=0 wks', :]
+dfpre = pd.concat([adata_pre.obs['classLabel'],
+               pd.DataFrame(adata_pre.raw.X,index=adata_pre.obs.index,
+                            columns=adata_pre.var_names),], axis=1) 
+lin_list_pre = adata_pre.obs.lineage
+
+
+#sc.pl.umap(adata_pre,color='classLabel', palette = ['red', 'green']) 
+npre = len(dfpre)
+print(npre)
+ypreb = dfpre.classLabel=='res'
+ypre= ypreb*1
+phirpre = (sum(ypre))/npre
+phispre = 1-phirpre
+print(phispre)
+
+adata_post1 = adata[adata.obs['timepoint']=='t=7 wks', :]
+dfpost1= pd.concat([adata_post1.obs['classLabel'],
+               pd.DataFrame(adata_post1.raw.X,index=adata_post1.obs.index,
+                            columns=adata_pre.var_names),], axis=1) 
+    
+npost1 = len(dfpost1)
+print(npost1)
+ypost1b = dfpost1.classLabel=='res'
+ypost1= ypost1b*1
+phirpost1 = (sum(ypost1))/npost1
+phispost1 = 1-phirpost1
+print(phispost1)
+
+
+adata_post2 = adata[adata.obs['timepoint']=='t=10 wks', :]
+dfpost2= pd.concat([adata_post2.obs['classLabel'],
+               pd.DataFrame(adata_post2.raw.X,index=adata_post2.obs.index,
+                            columns=adata_post2.var_names),], axis=1) 
+    
+npost2 = len(dfpost2)
+print(npost2)
+ypost2b = dfpost1.classLabel=='res'
+ypost2= ypost2b*1
+phirpost2 = (sum(ypost2))/npost2
+phispost2 = 1-phirpost2
+print(phispost2)
+#%% Export the phi estimates
+phi_est= {'phi_t': [phispre, phispost1, phispost2],
+        't': [0, 1176, 1656],
+        'ncells': [npre,npost1,npost2]
+        }
+
+dfphi= DataFrame(phi_est, columns= ['phi_t', 't', 'ncells'])
+
+print(dfphi)
+
+dfphi.to_csv("phi_t_est_pythSVM.csv")
+
+
+filename = "phi_t_est_pythSVM.csv"
+path = "/Users/kj22643/Documents/Documents/Grant_dose_optimization/data"
+fullpath = os.path.join(path, filename)
+dfphi.to_csv("phi_t_est_pythSVM.csv")
+#%% Plot the UMAPS with each time point of estimates
+sc.pl.umap(adata,color='TPclass', palette = [ 'red', 'green', 'gray', 'gray', 'gray', 'gray',]) 
+sc.pl.umap(adata,color='TPclass', palette = ['gray', 'gray', 'red', 'green', 'gray', 'gray']) 
+sc.pl.umap(adata,color='TPclass', palette = ['gray', 'gray', 'gray', 'gray', 'red', 'green']) 
+
+
+
+#%% Look at weights for each gene in the SVM
+# Order the weights
+ordered_indices = ((-np.abs(weights)).argsort()).transpose()
+
+ordered_weights=weightsdf.iloc[0,ordered_indices[:,0]]
+topweights = ordered_weights.index[0:50]
+
+sc.pl.matrixplot(adata, indtop, groupby = 'TPclass', swap_axes = True, standard_scale = 'var', figsize = [5, 10])
+#%% Plot the UMAPS of some key genes
+sc.pl.umap(adata,color=['SOX4'])
+sc.pl.umap(adata,color=['ESAM'])
+sc.pl.umap(adata,color=['IL11'])
