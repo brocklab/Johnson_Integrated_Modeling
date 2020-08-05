@@ -1,4 +1,4 @@
-# Dose_optimization
+# Integrated_Modeling
 
 For the classifier model from scRNAseq data (Python files)
 Prior to running scripts, download the data from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE154932. Local path will need to be indicated in the following scripts.
